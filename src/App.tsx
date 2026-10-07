@@ -1,48 +1,252 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
-  Table,
-  Download,
-  Copy,
   Check,
   Search,
   ChevronLeft,
   ChevronRight,
   Printer,
-  Eye,
-  EyeOff,
-  Users,
   Clock,
-  Trash2,
-  FileText,
   ChevronDown,
   X,
   TrendingUp,
-  Calendar
+  Calendar,
+  ExternalLink
 } from 'lucide-react';
-import datasetOriginal from './data/pontomais.json';
 import { PdfDropzone } from './components/PdfDropzone';
+import { EditableCell } from './components/EditableCell';
 import {
   ensureDateConsistencyAndColumnAlignment,
   formatTimeWithoutZero,
-  formatDateWithWeekday
+  formatDateWithWeekday,
+  toMinutes,
+  minutesToTime,
+  validateAndFormatTime
 } from './utils/parser';
 
-type ViewMode = 'original_sheet' | 'general_table';
-type StatusFilter = 'all' | 'he50' | 'he100';
+function saveDatasetToStorage(dataset: any, fileName?: string | null) {
+  try {
+    if (dataset) {
+      localStorage.setItem('pontomais_active_dataset', JSON.stringify(dataset));
+      if (fileName) {
+        localStorage.setItem('pontomais_loaded_filename', fileName);
+      }
+    } else {
+      localStorage.removeItem('pontomais_active_dataset');
+      localStorage.removeItem('pontomais_loaded_filename');
+    }
+  } catch (err) {
+    console.warn('Falha ao persistir dataset no localStorage:', err);
+  }
+}
+
+function updateRowField(row: any, fieldKey: string, newValue: string): any {
+  const updatedRow = { ...row };
+  const val = newValue === '' ? null : newValue;
+
+  switch (fieldKey) {
+    case 'data':
+      updatedRow.data = newValue;
+      break;
+    case 'entrada_1':
+      updatedRow.pontos = { ...(updatedRow.pontos || {}), entrada_1: val };
+      break;
+    case 'saida_1':
+      updatedRow.pontos = { ...(updatedRow.pontos || {}), saida_1: val };
+      break;
+    case 'entrada_2':
+      updatedRow.pontos = { ...(updatedRow.pontos || {}), entrada_2: val };
+      break;
+    case 'saida_2':
+      updatedRow.pontos = { ...(updatedRow.pontos || {}), saida_2: val };
+      break;
+    case 'credito':
+      updatedRow.totais_jornada = { ...(updatedRow.totais_jornada || {}), credito: newValue };
+      break;
+    case 'debito':
+      updatedRow.totais_jornada = { ...(updatedRow.totais_jornada || {}), debito: newValue };
+      break;
+    case 'h_intervalo':
+      updatedRow.totais_jornada = {
+        ...(updatedRow.totais_jornada || {}),
+        h_intervalo: newValue,
+        intervalo: newValue
+      };
+      break;
+    case 'horas_normais':
+      updatedRow.totais_jornada = { ...(updatedRow.totais_jornada || {}), horas_normais: newValue };
+      break;
+    case 'he_50':
+      updatedRow.total_horas_extras = {
+        ...(updatedRow.total_horas_extras || {}),
+        he_1_50: newValue
+      };
+      updatedRow.horas_extras = {
+        ...(updatedRow.horas_extras || {}),
+        he_50: newValue
+      };
+      break;
+    case 'he_100':
+      updatedRow.total_horas_extras = {
+        ...(updatedRow.total_horas_extras || {}),
+        he_2_100: newValue
+      };
+      updatedRow.horas_extras = {
+        ...(updatedRow.horas_extras || {}),
+        he_100: newValue
+      };
+      break;
+    case 'adic_noturno':
+      updatedRow.total_horas_extras = {
+        ...(updatedRow.total_horas_extras || {}),
+        adicional_noturno: newValue
+      };
+      updatedRow.horas_extras = {
+        ...(updatedRow.horas_extras || {}),
+        adicional_noturno: newValue
+      };
+      break;
+    case 'saldo':
+      updatedRow.saldo = newValue;
+      break;
+    case 'motivo':
+      updatedRow.motivo_observacao = val;
+      break;
+  }
+  return updatedRow;
+}
+
+function applySavedEditsToDataset(dataset: any): any {
+  if (!dataset?.colaboradores) return dataset;
+  try {
+    const rawEdits = localStorage.getItem('pontomais_user_edits');
+    if (!rawEdits) return dataset;
+    const editsMap = JSON.parse(rawEdits);
+
+    for (const c of dataset.colaboradores) {
+      const colabKey = String(c.id ?? c.colaborador);
+      const colabEdits = editsMap[colabKey];
+      if (colabEdits && c.registros) {
+        Object.entries(colabEdits).forEach(([rowIdxStr, fields]: [string, any]) => {
+          const rowIdx = parseInt(rowIdxStr, 10);
+          if (c.registros[rowIdx]) {
+            Object.entries(fields).forEach(([fKey, fVal]: [string, any]) => {
+              c.registros[rowIdx] = updateRowField(c.registros[rowIdx], fKey, fVal);
+            });
+          }
+        });
+
+        let sumHe50 = 0;
+        let sumHe100 = 0;
+        let sumNoturno = 0;
+        let totalBatidas = 0;
+        let diasTrabalhados = 0;
+
+        for (const r of c.registros) {
+          let batidas = 0;
+          if (r.pontos?.entrada_1) { totalBatidas++; batidas++; }
+          if (r.pontos?.saida_1) { totalBatidas++; batidas++; }
+          if (r.pontos?.entrada_2) { totalBatidas++; batidas++; }
+          if (r.pontos?.saida_2) { totalBatidas++; batidas++; }
+
+          const m50 = toMinutes(r.total_horas_extras?.he_1_50 || r.horas_extras?.he_50);
+          if (m50 > 0) sumHe50 += m50;
+
+          const m100 = toMinutes(r.total_horas_extras?.he_2_100 || r.horas_extras?.he_100);
+          if (m100 > 0) sumHe100 += m100;
+
+          const mNot = toMinutes(r.total_horas_extras?.adicional_noturno || r.horas_extras?.adicional_noturno);
+          if (mNot > 0) sumNoturno += mNot;
+
+          const mNorm = toMinutes(r.totais_jornada?.horas_normais);
+          if (batidas > 0 || m50 > 0 || m100 > 0 || mNorm > 0) {
+            diasTrabalhados++;
+          }
+        }
+
+        c.totais = {
+          ...c.totais,
+          he_1_50: minutesToTime(sumHe50),
+          he_50: minutesToTime(sumHe50),
+          he_2_100: minutesToTime(sumHe100),
+          he_100: minutesToTime(sumHe100),
+          adicional_noturno: minutesToTime(sumNoturno)
+        };
+        c.resumo_dias = {
+          ...c.resumo_dias,
+          dias_trabalhados: diasTrabalhados
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('Erro ao aplicar edições salvas:', err);
+  }
+  return dataset;
+}
 
 export default function App() {
-  // Start with no data loaded, waiting for user upload
-  const [activeDataset, setActiveDataset] = useState<any>(null);
-  const [loadedFileName, setLoadedFileName] = useState<string | null>(null);
+  // Restore active dataset and filename from localStorage if present
+  const [activeDataset, setActiveDataset] = useState<any>(() => {
+    try {
+      const saved = localStorage.getItem('pontomais_active_dataset');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return applySavedEditsToDataset(parsed);
+      }
+    } catch (e) {
+      console.warn('Erro ao restaurar dataset salvo:', e);
+    }
+    return null;
+  });
+
+  const [loadedFileName, setLoadedFileName] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('pontomais_loaded_filename') || null;
+    } catch {
+      return null;
+    }
+  });
+
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [viewMode, setViewMode] = useState<ViewMode>('original_sheet');
   const [selectedColabIndex, setSelectedColabIndex] = useState<number>(0);
-  const [searchTerm, setSearchTerm] = useState<string>('');
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-  const [showHiddenColumns, setShowHiddenColumns] = useState<boolean>(true);
-  const [copied, setCopied] = useState<boolean>(false);
   const [isDropdownOpen, setIsDropdownOpen] = useState<boolean>(false);
   const [colabSearchQuery, setColabSearchQuery] = useState<string>('');
+  const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
+
+  // Cell currently being edited
+  const [editingCell, setEditingCell] = useState<{ rowIdx: number; fieldKey: string } | null>(null);
+
+  // Mapa de campos alterados manualmente pelo usuário para exibição do indicador visual
+  const [userEdits, setUserEdits] = useState<Record<string, Record<number, Record<string, boolean>>>>(() => {
+    try {
+      const raw = localStorage.getItem('pontomais_user_edits');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const map: Record<string, Record<number, Record<string, boolean>>> = {};
+        Object.entries(parsed).forEach(([cKey, rows]: [string, any]) => {
+          map[cKey] = {};
+          Object.entries(rows).forEach(([rIdx, fields]: [string, any]) => {
+            map[cKey][Number(rIdx)] = {};
+            Object.keys(fields).forEach((fKey) => {
+              map[cKey][Number(rIdx)][fKey] = true;
+            });
+          });
+        });
+        return map;
+      }
+    } catch (e) {
+      console.warn('Erro ao restaurar userEdits do localStorage:', e);
+    }
+    return {};
+  });
+
+  // Revoke object URL on unmount or URL replacement
+  useEffect(() => {
+    return () => {
+      if (pdfBlobUrl) {
+        URL.revokeObjectURL(pdfBlobUrl);
+      }
+    };
+  }, [pdfBlobUrl]);
 
   const colaboradores = activeDataset?.colaboradores || [];
   const selectedColab = colaboradores[selectedColabIndex] || colaboradores[0] || null;
@@ -58,7 +262,7 @@ export default function App() {
       .filter((c: any) => c.colaborador.toLowerCase().includes(q) || c.id.toString().includes(q));
   }, [colaboradores, colabSearchQuery]);
 
-  // Column metrics for the active collaborator
+  // Column metrics for the active collaborator — recalculated dynamically from the displayed rows!
   const colabMetrics = useMemo(() => {
     if (!selectedColab) {
       return {
@@ -70,188 +274,223 @@ export default function App() {
       };
     }
 
-    const he50 = selectedColab.totais?.he_1_50 || selectedColab.totais?.he_50 || '00:00';
-    const he100 = selectedColab.totais?.he_2_100 || selectedColab.totais?.he_100 || '00:00';
-    const noturno = selectedColab.totais?.adicional_noturno || '00:00';
-    const diasTrabalhados = selectedColab.resumo_dias?.dias_trabalhados ?? 0;
-
+    let sumHe50 = 0;
+    let sumHe100 = 0;
+    let sumNoturno = 0;
     let totalBatidas = 0;
-    if (selectedColab.registros) {
-      for (const r of selectedColab.registros) {
-        if (r.pontos?.entrada_1) totalBatidas++;
-        if (r.pontos?.saida_1) totalBatidas++;
-        if (r.pontos?.entrada_2) totalBatidas++;
-        if (r.pontos?.saida_2) totalBatidas++;
+    let diasTrabalhados = 0;
+
+    const registros = selectedColab.registros || [];
+
+    for (const r of registros) {
+      let batidas = 0;
+      if (r.pontos?.entrada_1) { totalBatidas++; batidas++; }
+      if (r.pontos?.saida_1) { totalBatidas++; batidas++; }
+      if (r.pontos?.entrada_2) { totalBatidas++; batidas++; }
+      if (r.pontos?.saida_2) { totalBatidas++; batidas++; }
+
+      const m50 = toMinutes(r.total_horas_extras?.he_1_50 || r.horas_extras?.he_50);
+      if (m50 > 0) sumHe50 += m50;
+
+      const m100 = toMinutes(r.total_horas_extras?.he_2_100 || r.horas_extras?.he_100);
+      if (m100 > 0) sumHe100 += m100;
+
+      const mNot = toMinutes(r.total_horas_extras?.adicional_noturno || r.horas_extras?.adicional_noturno);
+      if (mNot > 0) sumNoturno += mNot;
+
+      const mNorm = toMinutes(r.totais_jornada?.horas_normais);
+      if (batidas > 0 || m50 > 0 || m100 > 0 || mNorm > 0) {
+        diasTrabalhados++;
       }
     }
+
+    const he50 = sumHe50 > 0 ? minutesToTime(sumHe50) : (selectedColab.totais?.he_1_50 || selectedColab.totais?.he_50 || '00:00');
+    const he100 = sumHe100 > 0 ? minutesToTime(sumHe100) : (selectedColab.totais?.he_2_100 || selectedColab.totais?.he_100 || '00:00');
+    const noturno = sumNoturno > 0 ? minutesToTime(sumNoturno) : (selectedColab.totais?.adicional_noturno || '00:00');
+    const finalDias = diasTrabalhados > 0 ? diasTrabalhados : (selectedColab.resumo_dias?.dias_trabalhados ?? 0);
 
     return {
       he50,
       he100,
       noturno,
-      diasTrabalhados,
+      diasTrabalhados: finalDias,
       totalBatidas
     };
   }, [selectedColab]);
 
-  // Filter for the general table
-  const filteredColaboradores = useMemo(() => {
-    return colaboradores.filter((c: any) => {
-      if (searchTerm) {
-        const term = searchTerm.toLowerCase();
-        if (!c.colaborador.toLowerCase().includes(term) && !c.id.toString().includes(term)) {
-          return false;
-        }
-      }
-      if (statusFilter === 'he50') {
-        const val = c.total_horas_extras?.he_1_50 || c.totais?.he_50 || '00:00';
-        if (val === '00:00') return false;
-      }
-      if (statusFilter === 'he100') {
-        const val = c.total_horas_extras?.he_2_100 || c.totais?.he_100 || '00:00';
-        if (val === '00:00') return false;
-      }
-      return true;
+  // Handle cell edit trigger
+  const handleStartEdit = (rowIdx: number, fieldKey: string) => {
+    if (fieldKey === 'data') return;
+    setEditingCell({ rowIdx, fieldKey });
+  };
+
+  const handleCancelEdit = () => {
+    setEditingCell(null);
+  };
+
+  // Commit edit and recalculate totals automatically
+  const handleCommitEdit = (newRawVal: string) => {
+    if (!editingCell || !selectedColab) return;
+    const { rowIdx, fieldKey } = editingCell;
+    if (fieldKey === 'data') return;
+    const isTime = fieldKey !== 'motivo';
+    const formattedVal = isTime ? validateAndFormatTime(newRawVal) : newRawVal.trim();
+
+    const currentRegistros = selectedColab.registros || [];
+    const newRegistros = currentRegistros.map((r: any, idx: number) => {
+      if (idx !== rowIdx) return r;
+      return updateRowField(r, fieldKey, formattedVal);
     });
-  }, [colaboradores, searchTerm, statusFilter]);
 
-  // Clean JSON string representing strictly the requested visible/mapped structure
-  const currentJsonString = useMemo(() => {
-    if (!activeDataset) {
-      return '{}';
-    }
+    let sumHe50 = 0;
+    let sumHe100 = 0;
+    let sumNoturno = 0;
+    let totalBatidas = 0;
+    let diasTrabalhados = 0;
 
-    if (!selectedColab) {
-      return JSON.stringify(activeDataset, null, 2);
-    }
+    for (const r of newRegistros) {
+      let batidas = 0;
+      if (r.pontos?.entrada_1) { totalBatidas++; batidas++; }
+      if (r.pontos?.saida_1) { totalBatidas++; batidas++; }
+      if (r.pontos?.entrada_2) { totalBatidas++; batidas++; }
+      if (r.pontos?.saida_2) { totalBatidas++; batidas++; }
 
-    if (viewMode === 'original_sheet') {
-      const diasMapped = selectedColab.registros?.map((r: any) => {
-        if (!showHiddenColumns) {
-          return {
-            data: formatDateWithWeekday(r.data, r.dia_semana),
-            pontos: {
-              entrada_1: r.pontos?.entrada_1 || null,
-              saida_1: r.pontos?.saida_1 || null,
-              entrada_2: r.pontos?.entrada_2 || null,
-              saida_2: r.pontos?.saida_2 || null
-            },
-            total_horas_extras: {
-              he_1_50: r.total_horas_extras?.he_1_50 || r.horas_extras?.he_50 || '00:00',
-              he_2_100: r.total_horas_extras?.he_2_100 || r.horas_extras?.he_100 || '00:00',
-              adicional_noturno: r.total_horas_extras?.adicional_noturno || r.horas_extras?.adicional_noturno || '00:00'
-            }
-          };
-        }
-        return r;
-      });
+      const m50 = toMinutes(r.total_horas_extras?.he_1_50 || r.horas_extras?.he_50);
+      if (m50 > 0) sumHe50 += m50;
 
-      const colabData: any = {
-        colaborador: selectedColab.colaborador,
-        periodo: selectedColab.periodo || activeDataset?.metadata?.periodo?.mes_referencia || 'De 01/08/2026 até 31/08/2026',
-        departamento: selectedColab.departamento || activeDataset?.metadata?.departamento || 'COMPESA GPM (22.4.417)',
-        dias: diasMapped,
-        totais: {
-          total_horas_extras: {
-            he_1_50: selectedColab.totais?.he_1_50 || selectedColab.totais?.he_50 || '00:00',
-            he_1_50_noturno: selectedColab.totais?.he_1_50_noturno || '00:00',
-            he_2_100: selectedColab.totais?.he_2_100 || selectedColab.totais?.he_100 || '00:00',
-            he_2_100_noturno: selectedColab.totais?.he_2_100_noturno || '00:00',
-            adicional_noturno: selectedColab.totais?.adicional_noturno || '00:00'
-          }
-        }
-      };
+      const m100 = toMinutes(r.total_horas_extras?.he_2_100 || r.horas_extras?.he_100);
+      if (m100 > 0) sumHe100 += m100;
 
-      if (showHiddenColumns) {
-        colabData.totais_jornada = selectedColab.totais_jornada || selectedColab.totais;
-        colabData.saldo_final = selectedColab.totais?.saldo;
+      const mNot = toMinutes(r.total_horas_extras?.adicional_noturno || r.horas_extras?.adicional_noturno);
+      if (mNot > 0) sumNoturno += mNot;
+
+      const mNorm = toMinutes(r.totais_jornada?.horas_normais);
+      if (batidas > 0 || m50 > 0 || m100 > 0 || mNorm > 0) {
+        diasTrabalhados++;
       }
-
-      return JSON.stringify(
-        {
-          documento: activeDataset?.metadata || {
-            sistema: 'pontomais',
-            titulo: 'Jornada',
-            departamento: selectedColab.departamento || 'COMPESA GPM (22.4.417)'
-          },
-          dados_colaborador: colabData
-        },
-        null,
-        2
-      );
     }
 
-    if (!showHiddenColumns) {
-      return JSON.stringify(
-        {
-          documento: activeDataset?.metadata,
-          colaboradores: colaboradores.map((c: any) => ({
-            id: c.id,
-            colaborador: c.colaborador,
-            dias_trabalhados: c.resumo_dias?.dias_trabalhados,
-            total_horas_extras: {
-              he_1_50: c.totais?.he_1_50 || c.totais?.he_50,
-              he_2_100: c.totais?.he_2_100 || c.totais?.he_100,
-              adicional_noturno: c.totais?.adicional_noturno
-            }
-          }))
-        },
-        null,
-        2
-      );
+    const updatedColab = {
+      ...selectedColab,
+      registros: newRegistros,
+      totais: {
+        ...selectedColab.totais,
+        he_1_50: minutesToTime(sumHe50),
+        he_50: minutesToTime(sumHe50),
+        he_2_100: minutesToTime(sumHe100),
+        he_100: minutesToTime(sumHe100),
+        adicional_noturno: minutesToTime(sumNoturno)
+      },
+      resumo_dias: {
+        ...selectedColab.resumo_dias,
+        dias_trabalhados: diasTrabalhados
+      }
+    };
+
+    setActiveDataset((prev: any) => {
+      if (!prev) return prev;
+      const updatedColabs = [...prev.colaboradores];
+      updatedColabs[selectedColabIndex] = updatedColab;
+      const newDataset = {
+        ...prev,
+        colaboradores: updatedColabs
+      };
+      saveDatasetToStorage(newDataset, loadedFileName);
+      return newDataset;
+    });
+
+    // Persist specific edit log in localStorage
+    const colabKey = String(selectedColab.id ?? selectedColab.colaborador);
+    try {
+      const rawEdits = localStorage.getItem('pontomais_user_edits');
+      const editsMap = rawEdits ? JSON.parse(rawEdits) : {};
+      if (!editsMap[colabKey]) editsMap[colabKey] = {};
+      if (!editsMap[colabKey][rowIdx]) editsMap[colabKey][rowIdx] = {};
+      editsMap[colabKey][rowIdx][fieldKey] = formattedVal;
+      localStorage.setItem('pontomais_user_edits', JSON.stringify(editsMap));
+    } catch (e) {
+      console.warn('Erro ao salvar edição no localStorage:', e);
     }
 
-    return JSON.stringify(activeDataset, null, 2);
-  }, [viewMode, selectedColab, showHiddenColumns, colaboradores, activeDataset]);
+    // Atualiza estado de campos modificados para refletir os triângulos imediatamente
+    setUserEdits((prev) => {
+      const next = { ...prev };
+      if (!next[colabKey]) next[colabKey] = {};
+      if (!next[colabKey][rowIdx]) next[colabKey][rowIdx] = {};
+      next[colabKey][rowIdx][fieldKey] = true;
+      return next;
+    });
 
-  const handleDataLoaded = (newDataset: any, fileName: string) => {
+    setEditingCell(null);
+  };
+
+  const handleDataLoaded = (newDataset: any, fileName: string, file?: File) => {
     const consistentDataset = ensureDateConsistencyAndColumnAlignment(newDataset);
-    setActiveDataset(consistentDataset);
+    const datasetWithEdits = applySavedEditsToDataset(consistentDataset);
+
+    setActiveDataset(datasetWithEdits);
     setLoadedFileName(fileName);
     setSelectedColabIndex(0);
     setColabSearchQuery('');
+    setEditingCell(null);
+
+    // Recarrega mapa de edições salvas
+    try {
+      const rawEdits = localStorage.getItem('pontomais_user_edits');
+      if (rawEdits) {
+        const parsed = JSON.parse(rawEdits);
+        const map: Record<string, Record<number, Record<string, boolean>>> = {};
+        Object.entries(parsed).forEach(([cKey, rows]: [string, any]) => {
+          map[cKey] = {};
+          Object.entries(rows).forEach(([rIdx, fields]: [string, any]) => {
+            map[cKey][Number(rIdx)] = {};
+            Object.keys(fields).forEach((fKey) => {
+              map[cKey][Number(rIdx)][fKey] = true;
+            });
+          });
+        });
+        setUserEdits(map);
+      }
+    } catch {
+      // ignore
+    }
+
+    saveDatasetToStorage(datasetWithEdits, fileName);
+
+    if (file) {
+      if (pdfBlobUrl) {
+        URL.revokeObjectURL(pdfBlobUrl);
+      }
+      let url: string;
+      if (file.type === 'application/pdf') {
+        url = URL.createObjectURL(file);
+      } else {
+        const pdfBlob = new Blob([file], { type: 'application/pdf' });
+        url = URL.createObjectURL(pdfBlob);
+      }
+      setPdfBlobUrl(url);
+    }
   };
 
   const handleClearData = () => {
+    if (pdfBlobUrl) {
+      URL.revokeObjectURL(pdfBlobUrl);
+    }
     setActiveDataset(null);
     setLoadedFileName(null);
+    setPdfBlobUrl(null);
     setSelectedColabIndex(0);
     setColabSearchQuery('');
-    setSearchTerm('');
-  };
+    setEditingCell(null);
+    setUserEdits({});
 
-  const handleLoadSample = () => {
-    const consistentDataset = ensureDateConsistencyAndColumnAlignment(datasetOriginal);
-    setActiveDataset(consistentDataset);
-    setLoadedFileName('espelho_ponto_demonstracao.pdf');
-    setSelectedColabIndex(0);
-    setColabSearchQuery('');
-    setSearchTerm('');
-  };
-
-  const handleCopyJson = () => {
-    if (!activeDataset) return;
-    navigator.clipboard.writeText(currentJsonString).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
-  };
-
-  const handleDownloadJson = () => {
-    if (!activeDataset) return;
-    const blob = new Blob([currentJsonString], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    const baseName = loadedFileName ? loadedFileName.replace(/\.[^/.]+$/, '') : 'pontomais_compesa';
-    a.download =
-      viewMode === 'original_sheet' && selectedColab
-        ? `${baseName}_${selectedColab.colaborador.toLowerCase().replace(/\s+/g, '_')}.json`
-        : `${baseName}_horas_extras.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try {
+      localStorage.removeItem('pontomais_active_dataset');
+      localStorage.removeItem('pontomais_loaded_filename');
+      localStorage.removeItem('pontomais_user_edits');
+    } catch {
+      // ignore
+    }
   };
 
   const handlePrint = () => {
@@ -263,17 +502,31 @@ export default function App() {
     <div className="min-h-screen bg-slate-100/70 text-slate-900 flex flex-col font-sans">
       {/* Top Application Toolbar */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-40 shadow-xs print:hidden">
-        <div className="max-w-7xl mx-auto px-4 py-2.5 flex flex-col sm:flex-row items-center justify-between gap-3">
+        <div className="max-w-7xl mx-auto px-3 sm:px-4 py-2 sm:py-2.5 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-2.5 sm:gap-3">
           {/* Header Title */}
-          <div className="flex items-center gap-2.5 w-full sm:w-auto flex-wrap">
-            <span className="text-sm font-bold text-slate-800 tracking-tight">
+          <div className="flex items-center gap-2 flex-wrap min-w-0">
+            <span className="text-xs sm:text-sm font-bold text-slate-800 tracking-tight truncate">
               {activeDataset?.metadata?.departamento ? `${activeDataset.metadata.departamento} · Espelho de Ponto` : 'Espelho de Ponto · Importação PDF'}
             </span>
             {loadedFileName ? (
-              <span className="inline-flex items-center gap-1 text-[11px] font-medium bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full border border-emerald-200">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse" />
-                <span>{loadedFileName}</span>
-              </span>
+              pdfBlobUrl ? (
+                <a
+                  href={pdfBlobUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-[11px] font-medium bg-emerald-100 text-emerald-800 hover:bg-emerald-200 px-2.5 py-0.5 rounded-full border border-emerald-300 transition-colors shadow-2xs max-w-full truncate"
+                  title="Clique para abrir o arquivo PDF original em uma nova aba"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse shrink-0" />
+                  <span className="truncate">{loadedFileName}</span>
+                  <ExternalLink className="w-2.5 h-2.5 text-emerald-700 shrink-0" />
+                </a>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-[11px] font-medium bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full border border-emerald-200 max-w-full truncate">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse shrink-0" />
+                  <span className="truncate">{loadedFileName}</span>
+                </span>
+              )
             ) : (
               <span className="inline-flex items-center gap-1 text-[11px] font-medium bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full border border-slate-200">
                 <span>Aguardando Upload</span>
@@ -281,147 +534,50 @@ export default function App() {
             )}
           </div>
 
-          {/* Mode Switcher Tabs */}
-          <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto justify-end">
-            <div className="inline-flex p-1 bg-slate-100 rounded-lg border border-slate-200 text-xs font-medium">
-              <button
-                type="button"
-                onClick={() => setViewMode('original_sheet')}
-                className={`px-3 py-1.5 rounded-md transition-colors flex items-center gap-1.5 ${
-                  viewMode === 'original_sheet'
-                    ? 'bg-white text-slate-900 shadow-xs font-semibold'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                <Table className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Tabela Formatada</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setViewMode('general_table')}
-                className={`px-3 py-1.5 rounded-md transition-colors flex items-center gap-1.5 ${
-                  viewMode === 'general_table'
-                    ? 'bg-white text-slate-900 shadow-xs font-semibold'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                <Users className="w-3.5 h-3.5 text-blue-600" />
-                <span>Lista Geral ({colaboradores.length})</span>
-              </button>
-            </div>
-
-            {/* Quick Actions */}
-            <div className="flex items-center gap-1.5">
-              {/* Button de Limpeza dos dados já carregados */}
-              {activeDataset && (
-                <button
-                  type="button"
-                  onClick={handleClearData}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 border border-rose-200 rounded hover:bg-rose-100 hover:text-rose-800 transition-colors shadow-2xs"
-                  title="Limpar dados carregados e retornar ao estado de upload"
-                >
-                  <Trash2 className="w-3.5 h-3.5 text-rose-600" />
-                  <span>Limpar Dados</span>
-                </button>
-              )}
-
-              <button
-                type="button"
-                disabled={!activeDataset}
-                onClick={() => setShowHiddenColumns(!showHiddenColumns)}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded border transition-colors shadow-2xs disabled:opacity-40 disabled:cursor-not-allowed ${
-                  showHiddenColumns
-                    ? 'bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100'
-                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
-                }`}
-                title={showHiddenColumns ? 'Ocultar colunas de Totais da jornada, Saldo e Motivo' : 'Exibir colunas de Totais da jornada, Saldo e Motivo'}
-              >
-                {showHiddenColumns ? <Eye className="w-3.5 h-3.5 text-amber-700" /> : <EyeOff className="w-3.5 h-3.5 text-slate-500" />}
-                <span>{showHiddenColumns ? 'Totais & Saldo: [Exibindo]' : 'Totais & Saldo: [Ocultos]'}</span>
-              </button>
-
-              <button
-                type="button"
-                disabled={!activeDataset}
-                onClick={handlePrint}
-                className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded border border-slate-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                title="Imprimir Tabela"
-              >
-                <Printer className="w-4 h-4" />
-              </button>
-
-              <button
-                type="button"
-                disabled={!activeDataset}
-                onClick={handleCopyJson}
-                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded hover:bg-slate-50 transition-colors shadow-2xs disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copied ? 'Copiado!' : 'Copiar'}</span>
-              </button>
-
-              <button
-                type="button"
-                disabled={!activeDataset}
-                onClick={handleDownloadJson}
-                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-white bg-slate-900 rounded hover:bg-slate-800 transition-colors shadow-2xs disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Download .JSON</span>
-              </button>
-            </div>
+          {/* Header Actions */}
+          <div className="flex items-center gap-1.5 sm:gap-2 justify-end shrink-0">
+            <button
+              type="button"
+              disabled={!activeDataset}
+              onClick={handlePrint}
+              className="px-2.5 sm:px-3 py-1.5 text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-md border border-slate-200 transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 text-xs font-semibold shadow-2xs"
+              title="Imprimir Folha de Ponto"
+            >
+              <Printer className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-600" />
+              <span>Imprimir</span>
+            </button>
           </div>
         </div>
       </header>
 
       {/* Main Content Area */}
-      <main className="max-w-7xl mx-auto px-2 sm:px-6 lg:px-8 py-5 w-full flex-1 space-y-4">
+      <main className="max-w-7xl mx-auto px-2 sm:px-4 lg:px-8 py-3 sm:py-5 w-full flex-1 space-y-3 sm:space-y-4 overflow-x-hidden">
         {/* Dynamic Drag-and-Drop PDF Upload Area */}
         <PdfDropzone
           onDataLoaded={handleDataLoaded}
           isProcessing={isProcessing}
           setIsProcessing={setIsProcessing}
           currentLoadedFileName={loadedFileName}
+          pdfUrl={pdfBlobUrl}
           onClearData={handleClearData}
           hasData={!!activeDataset}
-          onLoadSample={handleLoadSample}
         />
 
-        {/* State when no file/data is loaded */}
-        {!activeDataset ? (
-          <div className="bg-white border border-slate-200 rounded-2xl p-8 sm:p-12 text-center max-w-xl mx-auto shadow-xs my-6">
-            <div className="w-14 h-14 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto mb-3.5 border border-emerald-100 shadow-2xs">
-              <FileText className="w-7 h-7" />
-            </div>
-            <h3 className="text-base font-bold text-slate-800 mb-1.5">
-              Aguardando upload do espelho de ponto
-            </h3>
-            <p className="text-xs text-slate-500 max-w-md mx-auto mb-5 leading-relaxed">
-              O sistema inicia sem dados pré-carregados. Arraste e solte o arquivo <strong>PDF</strong> na área acima ou clique para selecionar do seu computador. Os dados serão interpretados e a tabela preenchida automaticamente.
-            </p>
-
-            <div className="inline-flex items-center gap-2 bg-slate-50 px-3.5 py-1.5 rounded-full border border-slate-200 text-xs text-slate-600">
-              <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-              <span className="font-medium text-slate-700">Aguardando arquivo PDF</span>
-            </div>
-          </div>
-        ) : (
-          <>
-            {/* VIEW 1: ESPELHO ORIGINAL COM AS COLUNAS OCULTADAS */}
-            {viewMode === 'original_sheet' && selectedColab && (
-          <div className="space-y-4">
+        {/* View and table when data is loaded */}
+        {activeDataset && (
+          selectedColab ? (
+            <div className="space-y-4">
             {/* Collaborator Selector Banner */}
-            <div className="bg-white p-3 rounded-lg border border-slate-200 flex flex-wrap items-center justify-between gap-3 shadow-2xs print:hidden">
-              <div className="flex items-center gap-2 relative">
+            <div className="bg-white p-2.5 sm:p-3 rounded-lg border border-slate-200 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2.5 sm:gap-3 shadow-2xs print:hidden">
+              <div className="flex items-center gap-2 relative w-full sm:w-auto">
                 <span className="text-xs font-medium text-slate-600 shrink-0">Colaborador:</span>
                 
                 {/* Personalized Combobox */}
-                <div className="relative">
+                <div className="relative flex-1 sm:flex-initial min-w-0">
                   <button
                     type="button"
                     onClick={() => setIsDropdownOpen(!isDropdownOpen)}
-                    className="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-xs font-semibold text-slate-800 hover:border-slate-400 focus:outline-hidden flex items-center justify-between gap-3 min-w-[240px] sm:min-w-[310px] shadow-2xs transition-colors"
+                    className="w-full bg-white border border-slate-300 rounded-md px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-slate-800 hover:border-slate-400 focus:outline-hidden flex items-center justify-between gap-2 min-w-0 sm:min-w-[280px] md:min-w-[320px] shadow-2xs transition-colors"
                   >
                     <span className="truncate">{selectedColab.colaborador}</span>
                     <div className="flex items-center gap-1 text-slate-400 shrink-0">
@@ -498,155 +654,142 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 text-xs">
+              <div className="flex items-center justify-between sm:justify-end gap-2 text-xs w-full sm:w-auto pt-1 sm:pt-0 border-t sm:border-t-0 border-slate-100">
                 <button
                   type="button"
                   disabled={selectedColabIndex === 0}
                   onClick={() => setSelectedColabIndex((prev) => Math.max(0, prev - 1))}
-                  className="px-2 py-1 rounded border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 transition-colors flex items-center gap-1"
+                  className="px-2 py-1 rounded border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
                 >
                   <ChevronLeft className="w-3.5 h-3.5" /> Anterior
                 </button>
-                <span className="font-mono text-slate-500">
+                <span className="font-mono text-slate-500 text-xs">
                   {selectedColabIndex + 1} de {colaboradores.length}
                 </span>
                 <button
                   type="button"
                   disabled={selectedColabIndex === colaboradores.length - 1}
                   onClick={() => setSelectedColabIndex((prev) => Math.min(colaboradores.length - 1, prev + 1))}
-                  className="px-2 py-1 rounded border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 transition-colors flex items-center gap-1"
+                  className="px-2 py-1 rounded border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
                 >
                   Próximo <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
             </div>
 
-            {/* Mapped Document Sheet with Hidden Columns Removed */}
-            <div className="bg-white border border-slate-300 rounded-lg p-4 sm:p-6 shadow-xs max-w-4xl mx-auto print:border-none print:shadow-none print:p-0">
-              {/* Header section with selected divs removed */}
-              <div className="border-b border-slate-200 pb-2.5 mb-3 flex items-center justify-between">
-                <div>
-                  <span className="font-semibold text-slate-800 text-xs">Colaborador:</span>{' '}
-                  <span className="font-bold text-slate-900 text-sm tracking-wide">
+            {/* Mapped Document Sheet with Columns Excluded */}
+            <div className="bg-white border border-slate-300 rounded-lg p-2.5 sm:p-5 md:p-6 shadow-xs max-w-5xl mx-auto print:border-none print:shadow-none print:p-0">
+              {/* Header section */}
+              <div className="border-b border-slate-200 pb-2 mb-2.5 sm:mb-3 flex items-center justify-between flex-wrap gap-1">
+                <div className="min-w-0">
+                  <span className="font-semibold text-slate-600 text-[11px] sm:text-xs">Colaborador:</span>{' '}
+                  <span className="font-bold text-slate-900 text-xs sm:text-sm tracking-wide truncate block sm:inline">
                     {selectedColab.colaborador}
                   </span>
                 </div>
-                <div className="font-bold text-xl text-slate-900 tracking-tight">
+                <div className="font-bold text-base sm:text-lg md:text-xl text-slate-900 tracking-tight shrink-0">
                   Jornada
                 </div>
               </div>
 
               {/* Statistical Column Metric Cards */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mb-3.5">
-                <div className="bg-slate-50 border border-slate-200 rounded-md p-2.5">
-                  <div className="text-[11px] font-medium text-slate-500 flex items-center justify-between">
-                    <span>Soma H.E. 1 (50%)</span>
-                    <Clock className="w-3.5 h-3.5 text-emerald-600" />
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-2.5 mb-2.5 sm:mb-3.5">
+                <div className="bg-slate-50 border border-slate-200 rounded-md p-2 sm:p-2.5">
+                  <div className="text-[10.5px] sm:text-[11px] font-medium text-slate-500 flex items-center justify-between">
+                    <span className="truncate">Soma H.E. 1 (50%)</span>
+                    <Clock className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-emerald-600 shrink-0 ml-1" />
                   </div>
-                  <div className="text-lg font-bold font-mono text-emerald-700 tabular-nums mt-0.5">
+                  <div className="text-base sm:text-lg font-bold font-mono text-emerald-700 tabular-nums mt-0.5">
                     {colabMetrics.he50}h
                   </div>
-                  <div className="text-[10px] text-slate-400 mt-0.5">
+                  <div className="text-[9.5px] sm:text-[10px] text-slate-400 mt-0.5 truncate">
                     Noturno: {selectedColab.totais?.he_1_50_noturno || '00:00'}
                   </div>
                 </div>
 
-                <div className="bg-slate-50 border border-slate-200 rounded-md p-2.5">
-                  <div className="text-[11px] font-medium text-slate-500 flex items-center justify-between">
-                    <span>Soma H.E. 2 (100%)</span>
-                    <TrendingUp className="w-3.5 h-3.5 text-blue-600" />
+                <div className="bg-slate-50 border border-slate-200 rounded-md p-2 sm:p-2.5">
+                  <div className="text-[10.5px] sm:text-[11px] font-medium text-slate-500 flex items-center justify-between">
+                    <span className="truncate">Soma H.E. 2 (100%)</span>
+                    <TrendingUp className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-blue-600 shrink-0 ml-1" />
                   </div>
-                  <div className="text-lg font-bold font-mono text-blue-700 tabular-nums mt-0.5">
+                  <div className="text-base sm:text-lg font-bold font-mono text-blue-700 tabular-nums mt-0.5">
                     {colabMetrics.he100}h
                   </div>
-                  <div className="text-[10px] text-slate-400 mt-0.5">
+                  <div className="text-[9.5px] sm:text-[10px] text-slate-400 mt-0.5 truncate">
                     Noturno: {selectedColab.totais?.he_2_100_noturno || '00:00'}
                   </div>
                 </div>
 
-                <div className="bg-slate-50 border border-slate-200 rounded-md p-2.5">
-                  <div className="text-[11px] font-medium text-slate-500 flex items-center justify-between">
-                    <span>Soma Adic. Noturno</span>
-                    <Clock className="w-3.5 h-3.5 text-indigo-600" />
+                <div className="bg-slate-50 border border-slate-200 rounded-md p-2 sm:p-2.5">
+                  <div className="text-[10.5px] sm:text-[11px] font-medium text-slate-500 flex items-center justify-between">
+                    <span className="truncate">Soma Adic. Noturno</span>
+                    <Clock className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-indigo-600 shrink-0 ml-1" />
                   </div>
-                  <div className="text-lg font-bold font-mono text-indigo-700 tabular-nums mt-0.5">
+                  <div className="text-base sm:text-lg font-bold font-mono text-indigo-700 tabular-nums mt-0.5">
                     {colabMetrics.noturno}h
                   </div>
-                  <div className="text-[10px] text-slate-400 mt-0.5">
+                  <div className="text-[9.5px] sm:text-[10px] text-slate-400 mt-0.5 truncate">
                     Total noturno apurado
                   </div>
                 </div>
 
-                <div className="bg-slate-50 border border-slate-200 rounded-md p-2.5">
-                  <div className="text-[11px] font-medium text-slate-500 flex items-center justify-between">
-                    <span>Total de Batidas</span>
-                    <Calendar className="w-3.5 h-3.5 text-slate-500" />
+                <div className="bg-slate-50 border border-slate-200 rounded-md p-2 sm:p-2.5">
+                  <div className="text-[10.5px] sm:text-[11px] font-medium text-slate-500 flex items-center justify-between">
+                    <span className="truncate">Total de Batidas</span>
+                    <Calendar className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-slate-500 shrink-0 ml-1" />
                   </div>
-                  <div className="text-lg font-bold font-mono text-slate-800 tabular-nums mt-0.5">
+                  <div className="text-base sm:text-lg font-bold font-mono text-slate-800 tabular-nums mt-0.5">
                     {colabMetrics.totalBatidas}
                   </div>
-                  <div className="text-[10px] text-slate-400 mt-0.5">
+                  <div className="text-[9.5px] sm:text-[10px] text-slate-400 mt-0.5 truncate">
                     Em {colabMetrics.diasTrabalhados} dias trabalhados
                   </div>
                 </div>
               </div>
 
-              {/* Document Table with Selected Columns Visible */}
-              <div className="overflow-x-auto border border-slate-400">
-                <table className="w-full border-collapse text-[10.5px] font-sans">
+              {/* Informative Spreadsheet Tip */}
+              <div className="flex flex-wrap items-center justify-between text-[10.5px] sm:text-[11px] text-slate-500 pb-1 gap-1.5 print:hidden">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="flex items-center gap-1.5 font-medium text-slate-700">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0"></span>
+                    <span>Duplo clique em qualquer célula para alterar ou adicionar valores.</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 text-[10px] sm:text-[10.5px] text-amber-800 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
+                    <span className="w-0 h-0 border-solid border-t-[5px] border-t-amber-500 border-l-[5px] border-l-transparent shrink-0"></span>
+                    <span>Modificado manualmente</span>
+                  </span>
+                </div>
+                <span className="text-[10px] sm:text-[10.5px] text-slate-400 hidden sm:inline">
+                  Enter ou clique fora para salvar automaticamente · Esc para cancelar
+                </span>
+              </div>
+
+              {/* Document Table without Totais da jornada, Saldo and Motivo */}
+              <div className="overflow-x-auto border border-slate-300 rounded-xs shadow-2xs">
+                <table className="w-full border-collapse text-[10.5px] font-sans min-w-[560px]">
                   <thead>
                     {/* Top Group Header Row */}
                     <tr className="bg-slate-100 text-slate-700 text-center font-semibold border-b border-slate-300">
-                      <th rowSpan={2} className="border-r border-slate-300 py-1.5 px-3 text-center min-w-[175px] w-48">
+                      <th rowSpan={2} className="border-r border-slate-300 py-1.5 px-2.5 text-center w-28 sm:w-36">
                         Data
                       </th>
                       <th colSpan={4} className="border-r border-slate-300 py-1 px-1 bg-slate-100/90">
                         Pontos
                       </th>
-
-                      {/* Optional Totais da jornada (Hidden by default) */}
-                      {showHiddenColumns && (
-                        <th colSpan={4} className="border-r border-slate-300 py-1 px-1 bg-amber-50/70 text-amber-900">
-                          Totais da jornada
-                        </th>
-                      )}
-
-                      <th colSpan={3} className={`py-1 px-1 bg-slate-100/90 ${showHiddenColumns ? 'border-r border-slate-300' : ''}`}>
+                      <th colSpan={3} className="py-1 px-1 bg-slate-100/90">
                         Total de H. Extras
                       </th>
-
-                      {/* Optional Saldo & Motivo (Hidden by default) */}
-                      {showHiddenColumns && (
-                        <>
-                          <th rowSpan={2} className="border-r border-slate-300 py-1.5 px-2 text-right w-16 bg-amber-50/70 text-amber-900">
-                            Saldo
-                          </th>
-                          <th rowSpan={2} className="py-1.5 px-2 text-left min-w-[130px] bg-amber-50/70 text-amber-900">
-                            Motivo/Observação
-                          </th>
-                        </>
-                      )}
                     </tr>
 
                     {/* Sub-Header Columns Row */}
                     <tr className="bg-slate-100 text-slate-700 text-[10px] font-semibold border-b border-slate-400">
-                      <th className="border-r border-slate-300 py-1 px-1 text-center w-14">1ª Entrada</th>
-                      <th className="border-r border-slate-300 py-1 px-1 text-center w-14">1ª Saída</th>
-                      <th className="border-r border-slate-300 py-1 px-1 text-center w-14">2ª Entrada</th>
-                      <th className="border-r border-slate-300 py-1 px-1 text-center w-14">2ª Saída</th>
-
-                      {showHiddenColumns && (
-                        <>
-                          <th className="border-r border-slate-300 py-1 px-1 text-center w-12 bg-amber-50/50">Crédito</th>
-                          <th className="border-r border-slate-300 py-1 px-1 text-center w-12 bg-amber-50/50">Débito</th>
-                          <th className="border-r border-slate-300 py-1 px-1 text-center w-14 bg-amber-50/50">H. intervalo</th>
-                          <th className="border-r border-slate-300 py-1 px-1 text-center w-14 bg-amber-50/50">Horas normais</th>
-                        </>
-                      )}
-
-                      <th className="border-r border-slate-300 py-1 px-2 text-center w-20">H.E. 1 (50%)</th>
-                      <th className="border-r border-slate-300 py-1 px-2 text-center w-20">H.E. 2 (100%)</th>
-                      <th className="py-1 px-2 text-center w-24">Adicional noturno</th>
+                      <th className="border-r border-slate-300 py-1 px-1 text-center w-14 sm:w-16">1ª Entrada</th>
+                      <th className="border-r border-slate-300 py-1 px-1 text-center w-14 sm:w-16">1ª Saída</th>
+                      <th className="border-r border-slate-300 py-1 px-1 text-center w-14 sm:w-16">2ª Entrada</th>
+                      <th className="border-r border-slate-300 py-1 px-1 text-center w-14 sm:w-16">2ª Saída</th>
+                      <th className="border-r border-slate-300 py-1 px-1.5 text-center w-16 sm:w-20">H.E. 1 (50%)</th>
+                      <th className="border-r border-slate-300 py-1 px-1.5 text-center w-16 sm:w-20">H.E. 2 (100%)</th>
+                      <th className="py-1 px-1.5 text-center w-20 sm:w-24">Adicional noturno</th>
                     </tr>
                   </thead>
 
@@ -666,6 +809,9 @@ export default function App() {
                         const isHighlightedRed = isDomingo || hasHe100;
                         const isWeekend = row.dia_semana === 'Sáb' || row.dia_semana === 'Dom';
 
+                        const colabKey = String(selectedColab.id ?? selectedColab.colaborador);
+                        const rowEdits = userEdits[colabKey]?.[rIdx] || {};
+
                         return (
                           <tr
                             key={rIdx}
@@ -678,68 +824,112 @@ export default function App() {
                             }`}
                           >
                             {/* Data */}
-                            <td className={`py-1 px-3 border-r border-slate-300 font-sans whitespace-nowrap ${
-                              isHighlightedRed ? 'text-rose-900 font-semibold' : 'text-slate-800'
-                            }`}>
-                              {formatDateWithWeekday(row.data, row.dia_semana)}
-                            </td>
+                            <EditableCell
+                              value={row.data}
+                              rawDisplayValue={formatDateWithWeekday(row.data, row.dia_semana)}
+                              fieldKey="data"
+                              rowIdx={rIdx}
+                              editingCell={editingCell}
+                              onStartEdit={handleStartEdit}
+                              onCommit={handleCommitEdit}
+                              onCancel={handleCancelEdit}
+                              align="left"
+                              isTime={false}
+                              readOnly={true}
+                              className={`py-1 px-2.5 border-r border-slate-300 font-sans whitespace-nowrap ${
+                                isHighlightedRed ? 'text-rose-900 font-semibold' : 'text-slate-800'
+                              }`}
+                            />
 
                             {/* Pontos */}
-                            <td className="py-1 px-1 border-r border-slate-300 text-center text-slate-700">
-                              {row.pontos?.entrada_1 || ''}
-                            </td>
-                            <td className="py-1 px-1 border-r border-slate-300 text-center text-slate-700">
-                              {row.pontos?.saida_1 || ''}
-                            </td>
-                            <td className="py-1 px-1 border-r border-slate-300 text-center text-slate-700">
-                              {row.pontos?.entrada_2 || ''}
-                            </td>
-                            <td className="py-1 px-1 border-r border-slate-300 text-center text-slate-700">
-                              {row.pontos?.saida_2 || ''}
-                            </td>
-
-                            {/* Optional Totais da jornada */}
-                            {showHiddenColumns && (
-                              <>
-                                <td className={`py-1 px-1 border-r border-slate-300 text-center text-slate-700 ${isHighlightedRed ? '' : 'bg-amber-50/20'}`}>
-                                  {formatTimeWithoutZero(row.totais_jornada?.credito)}
-                                </td>
-                                <td className={`py-1 px-1 border-r border-slate-300 text-center text-slate-700 ${isHighlightedRed ? '' : 'bg-amber-50/20'}`}>
-                                  {formatTimeWithoutZero(row.totais_jornada?.debito)}
-                                </td>
-                                <td className={`py-1 px-1 border-r border-slate-300 text-center text-slate-700 ${isHighlightedRed ? '' : 'bg-amber-50/20'}`}>
-                                  {formatTimeWithoutZero(row.totais_jornada?.h_intervalo || row.totais_jornada?.intervalo)}
-                                </td>
-                                <td className={`py-1 px-1 border-r border-slate-300 text-center text-slate-700 ${isHighlightedRed ? '' : 'bg-amber-50/20'}`}>
-                                  {formatTimeWithoutZero(row.totais_jornada?.horas_normais)}
-                                </td>
-                              </>
-                            )}
+                            <EditableCell
+                              value={row.pontos?.entrada_1}
+                              rawDisplayValue={row.pontos?.entrada_1 || ''}
+                              fieldKey="entrada_1"
+                              rowIdx={rIdx}
+                              editingCell={editingCell}
+                              onStartEdit={handleStartEdit}
+                              onCommit={handleCommitEdit}
+                              onCancel={handleCancelEdit}
+                              isModified={Boolean(rowEdits['entrada_1'])}
+                              className="py-1 px-1 border-r border-slate-300 text-center text-slate-700"
+                            />
+                            <EditableCell
+                              value={row.pontos?.saida_1}
+                              rawDisplayValue={row.pontos?.saida_1 || ''}
+                              fieldKey="saida_1"
+                              rowIdx={rIdx}
+                              editingCell={editingCell}
+                              onStartEdit={handleStartEdit}
+                              onCommit={handleCommitEdit}
+                              onCancel={handleCancelEdit}
+                              isModified={Boolean(rowEdits['saida_1'])}
+                              className="py-1 px-1 border-r border-slate-300 text-center text-slate-700"
+                            />
+                            <EditableCell
+                              value={row.pontos?.entrada_2}
+                              rawDisplayValue={row.pontos?.entrada_2 || ''}
+                              fieldKey="entrada_2"
+                              rowIdx={rIdx}
+                              editingCell={editingCell}
+                              onStartEdit={handleStartEdit}
+                              onCommit={handleCommitEdit}
+                              onCancel={handleCancelEdit}
+                              isModified={Boolean(rowEdits['entrada_2'])}
+                              className="py-1 px-1 border-r border-slate-300 text-center text-slate-700"
+                            />
+                            <EditableCell
+                              value={row.pontos?.saida_2}
+                              rawDisplayValue={row.pontos?.saida_2 || ''}
+                              fieldKey="saida_2"
+                              rowIdx={rIdx}
+                              editingCell={editingCell}
+                              onStartEdit={handleStartEdit}
+                              onCommit={handleCommitEdit}
+                              onCancel={handleCancelEdit}
+                              isModified={Boolean(rowEdits['saida_2'])}
+                              className="py-1 px-1 border-r border-slate-300 text-center text-slate-700"
+                            />
 
                             {/* Total de Horas Extras */}
-                            <td className="py-1 px-2 border-r border-slate-300 text-center text-slate-800 font-medium">
-                              {formatTimeWithoutZero(row.total_horas_extras?.he_1_50 || row.horas_extras?.he_50)}
-                            </td>
-                            <td className={`py-1 px-2 border-r border-slate-300 text-center font-medium ${
-                              hasHe100 ? 'text-rose-700 font-bold bg-rose-100/40' : 'text-slate-800'
-                            }`}>
-                              {he100Val}
-                            </td>
-                            <td className={`py-1 px-2 text-center text-slate-700 ${showHiddenColumns ? 'border-r border-slate-300' : ''}`}>
-                              {formatTimeWithoutZero(row.total_horas_extras?.adicional_noturno || row.horas_extras?.adicional_noturno)}
-                            </td>
-
-                            {/* Optional Saldo & Motivo */}
-                            {showHiddenColumns && (
-                              <>
-                                <td className={`py-1 px-2 border-r border-slate-300 text-right font-semibold text-slate-800 ${isHighlightedRed ? '' : 'bg-amber-50/20'}`}>
-                                  {formatTimeWithoutZero(row.saldo)}
-                                </td>
-                                <td className={`py-1 px-2 font-sans text-slate-700 whitespace-nowrap text-[10px] ${isHighlightedRed ? '' : 'bg-amber-50/20'}`}>
-                                  {formatTimeWithoutZero(row.motivo_observacao)}
-                                </td>
-                              </>
-                            )}
+                            <EditableCell
+                              value={row.total_horas_extras?.he_1_50 || row.horas_extras?.he_50}
+                              rawDisplayValue={formatTimeWithoutZero(row.total_horas_extras?.he_1_50 || row.horas_extras?.he_50)}
+                              fieldKey="he_50"
+                              rowIdx={rIdx}
+                              editingCell={editingCell}
+                              onStartEdit={handleStartEdit}
+                              onCommit={handleCommitEdit}
+                              onCancel={handleCancelEdit}
+                              isModified={Boolean(rowEdits['he_50'])}
+                              className="py-1 px-1.5 sm:px-2 border-r border-slate-300 text-center text-slate-800 font-medium"
+                            />
+                            <EditableCell
+                              value={row.total_horas_extras?.he_2_100 || row.horas_extras?.he_100}
+                              rawDisplayValue={he100Val}
+                              fieldKey="he_100"
+                              rowIdx={rIdx}
+                              editingCell={editingCell}
+                              onStartEdit={handleStartEdit}
+                              onCommit={handleCommitEdit}
+                              onCancel={handleCancelEdit}
+                              isModified={Boolean(rowEdits['he_100'])}
+                              className={`py-1 px-1.5 sm:px-2 border-r border-slate-300 text-center font-medium ${
+                                hasHe100 ? 'text-rose-700 font-bold bg-rose-100/40' : 'text-slate-800'
+                              }`}
+                            />
+                            <EditableCell
+                              value={row.total_horas_extras?.adicional_noturno || row.horas_extras?.adicional_noturno}
+                              rawDisplayValue={formatTimeWithoutZero(row.total_horas_extras?.adicional_noturno || row.horas_extras?.adicional_noturno)}
+                              fieldKey="adic_noturno"
+                              rowIdx={rIdx}
+                              editingCell={editingCell}
+                              onStartEdit={handleStartEdit}
+                              onCommit={handleCommitEdit}
+                              onCancel={handleCancelEdit}
+                              isModified={Boolean(rowEdits['adic_noturno'])}
+                              className="py-1 px-1.5 sm:px-2 text-center text-slate-700"
+                            />
                           </tr>
                         );
                       })
@@ -751,115 +941,11 @@ export default function App() {
               {/* End of Document Table */}
             </div>
           </div>
-        )}
-
-        {viewMode === 'original_sheet' && !selectedColab && (
-          <div className="bg-white border border-slate-200 rounded-lg p-8 text-center text-slate-500 text-sm shadow-xs">
+        ) : (
+          <div className="bg-white border border-slate-200 rounded-lg p-6 sm:p-8 text-center text-slate-500 text-xs sm:text-sm shadow-xs">
             Nenhum registro de colaborador disponível para exibição no momento. Arraste um arquivo PDF acima para carregar os dados.
           </div>
-        )}
-
-        {/* VIEW 2: LISTA GERAL COM AS COLUNAS ESPECÍFICAS */}
-        {viewMode === 'general_table' && (
-          <div className="space-y-4">
-            {/* Filter Bar */}
-            <div className="bg-white p-3 rounded-lg border border-slate-200 shadow-2xs flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
-              <div className="relative flex-1 min-w-[200px]">
-                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Buscar colaborador por nome..."
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-hidden"
-                />
-              </div>
-
-              <div className="flex items-center gap-1 overflow-x-auto text-xs">
-                <button
-                  type="button"
-                  onClick={() => setStatusFilter('all')}
-                  className={`px-2.5 py-1 rounded text-xs whitespace-nowrap ${
-                    statusFilter === 'all'
-                      ? 'bg-slate-900 text-white font-medium'
-                      : 'bg-slate-100 text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Todos ({colaboradores.length})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setStatusFilter('he50')}
-                  className={`px-2.5 py-1 rounded text-xs whitespace-nowrap ${
-                    statusFilter === 'he50'
-                      ? 'bg-emerald-600 text-white font-medium'
-                      : 'bg-slate-100 text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Com H.E. 50%
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setStatusFilter('he100')}
-                  className={`px-2.5 py-1 rounded text-xs whitespace-nowrap ${
-                    statusFilter === 'he100'
-                      ? 'bg-blue-600 text-white font-medium'
-                      : 'bg-slate-100 text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Com H.E. 100%
-                </button>
-              </div>
-            </div>
-
-            {/* Consolidated Table */}
-            <div className="bg-white rounded-lg border border-slate-200 shadow-2xs overflow-x-auto">
-              <table className="w-full text-xs text-left border-collapse">
-                <thead className="bg-slate-100 border-b border-slate-200 font-semibold text-slate-600">
-                  <tr>
-                    <th className="py-2.5 px-3 w-12">#</th>
-                    <th className="py-2.5 px-3">Colaborador</th>
-                    <th className="py-2.5 px-3 text-center">Dias Trab.</th>
-                    <th className="py-2.5 px-3 text-right font-mono text-emerald-800">H.E. 1 (50%)</th>
-                    <th className="py-2.5 px-3 text-right font-mono text-blue-800">H.E. 2 (100%)</th>
-                    <th className="py-2.5 px-3 text-right font-mono">Adic. Noturno</th>
-                    <th className="py-2.5 px-3 text-center">Visualizar</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {filteredColaboradores.map((c: any) => (
-                    <tr
-                      key={c.id}
-                      className="hover:bg-slate-50 transition-colors cursor-pointer"
-                      onClick={() => {
-                        const originalIdx = colaboradores.findIndex((item: any) => item.id === c.id);
-                        if (originalIdx !== -1) setSelectedColabIndex(originalIdx);
-                        setViewMode('original_sheet');
-                      }}
-                    >
-                      <td className="py-2.5 px-3 font-mono text-slate-400">{c.id.toString().padStart(2, '0')}</td>
-                      <td className="py-2.5 px-3 font-semibold text-slate-900">{c.colaborador}</td>
-                      <td className="py-2.5 px-3 text-center font-mono">{c.resumo_dias?.dias_trabalhados}</td>
-                      <td className="py-2.5 px-3 text-right font-mono text-emerald-700 font-semibold">{formatTimeWithoutZero(c.totais?.he_50 || c.totais?.he_1_50)}</td>
-                      <td className="py-2.5 px-3 text-right font-mono text-blue-700 font-semibold">{formatTimeWithoutZero(c.totais?.he_2_100 || c.totais?.he_100)}</td>
-                      <td className="py-2.5 px-3 text-right font-mono text-slate-500">{formatTimeWithoutZero(c.totais?.adicional_noturno)}</td>
-                      <td className="py-2.5 px-3 text-center">
-                        <button
-                          type="button"
-                          className="px-2.5 py-1 text-[11px] text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded border border-emerald-200 transition-colors font-medium"
-                        >
-                          Ver Espelho
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-      </>
-    )}
+        ))}
   </main>
     </div>
   );

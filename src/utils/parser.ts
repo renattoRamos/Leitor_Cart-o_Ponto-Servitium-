@@ -41,6 +41,64 @@ export function toMinutes(timeStr: string | null | undefined): number {
   return h * 60 + m;
 }
 
+export function minutesToTime(totalMin: number): string {
+  if (totalMin <= 0) return '00:00';
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+}
+
+export function validateAndFormatTime(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return '';
+  if (/^[+-]?0{1,2}(?::00)?$/.test(trimmed)) return '00:00';
+  const colonMatch = trimmed.match(/^([+-]?)(\d{1,4}):(\d{1,2})$/);
+  if (colonMatch) {
+    const sign = colonMatch[1] || '';
+    const h = colonMatch[2].padStart(2, '0');
+    const m = colonMatch[3].padStart(2, '0');
+    return `${sign}${h}:${m}`;
+  }
+  if (/^\d{3,4}$/.test(trimmed)) {
+    const h = trimmed.slice(0, trimmed.length - 2).padStart(2, '0');
+    const m = trimmed.slice(trimmed.length - 2);
+    return `${h}:${m}`;
+  }
+  if (/^\d{1,2}$/.test(trimmed)) {
+    return `${trimmed.padStart(2, '0')}:00`;
+  }
+  return trimmed;
+}
+
+/**
+ * Formata dinamicamente o valor de tempo/horas para exibição na tabela.
+ * - Valores não-nulos e válidos são formatados no padrão HH:MM.
+ * - Valores zerados ('00:00', '0:00', '0', etc.) retornam '00:00' formatado dinamicamente.
+ * - Valores nulos, indefinidos ou vazios retornam ''.
+ */
+export function formatTimeDynamic(val: string | null | undefined): string {
+  if (val === null || val === undefined) return '';
+  const trimmed = String(val).trim();
+  if (!trimmed) return '';
+  if (
+    /^[+-]?0{1,2}(?::0{1,2}(?::0{1,2})?)?$/.test(trimmed) ||
+    trimmed === '0' ||
+    trimmed === '00' ||
+    trimmed === '+0' ||
+    trimmed === '-0'
+  ) {
+    return '00:00';
+  }
+  const match = trimmed.match(/^([+-]?)(\d{1,4}):(\d{1,2})$/);
+  if (match) {
+    const sign = match[1] || '';
+    const h = match[2].padStart(2, '0');
+    const m = match[3].padStart(2, '0');
+    return `${sign}${h}:${m}`;
+  }
+  return trimmed;
+}
+
 export function getDiaSemana(dataStr: string): string {
   const parts = dataStr.split('/');
   if (parts.length === 3) {
