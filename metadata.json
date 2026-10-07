@@ -1,0 +1,6 @@
+{
+  "name": "Extrator de Ponto - JSON",
+  "description": "Extração estruturada em JSON puro dos dados de jornada e folha de ponto da COMPESA GPM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
